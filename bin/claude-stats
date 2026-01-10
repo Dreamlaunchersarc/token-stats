@@ -19,6 +19,97 @@ REFRESH_INTERVAL = 2  # seconds
 CONTENT_WIDTH = 75  # Fixed content width for centering
 
 STATS_DIR = Path.home() / ".claude" / "stats"
+PRICING_FILE = STATS_DIR / "pricing.json"
+
+# Default API pricing per million tokens (as of 2025)
+# Source: https://docs.anthropic.com/en/docs/about-claude/pricing
+DEFAULT_PRICING = {
+    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00, "cache_read": 0.08, "cache_write": 1.00},
+}
+
+# Fallback pricing by model family (used when specific model not found)
+FAMILY_PRICING = {
+    "opus": {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
+    "sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+    "haiku": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
+}
+
+
+def get_family_pricing(model: str) -> dict:
+    """Get fallback pricing based on model family (opus/sonnet/haiku)."""
+    model_lower = model.lower()
+    if "opus" in model_lower:
+        return FAMILY_PRICING["opus"]
+    elif "haiku" in model_lower:
+        return FAMILY_PRICING["haiku"]
+    return FAMILY_PRICING["sonnet"]
+
+
+def load_pricing() -> dict:
+    """Load pricing from user config file merged with defaults."""
+    pricing = DEFAULT_PRICING.copy()
+
+    # Load user overrides (highest priority)
+    if PRICING_FILE.exists():
+        try:
+            with open(PRICING_FILE, "r") as f:
+                custom = json.load(f)
+                pricing.update(custom)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    return pricing
+
+
+def get_model_pricing(model: str, pricing: dict) -> dict:
+    """Get pricing for a model. Falls back to family pricing for unknown models."""
+    # Direct match
+    if model in pricing:
+        return pricing[model]
+
+    # Partial match
+    for key in pricing:
+        if key in model or model in key:
+            return pricing[key]
+
+    # Fallback to family-based pricing
+    return get_family_pricing(model)
+
+
+def calculate_cost(tokens: dict, model: str, pricing: dict) -> float:
+    """Calculate cost for given token counts."""
+    mp = get_model_pricing(model, pricing)
+    cost = 0.0
+    cost += (tokens.get("input_tokens", 0) / 1_000_000) * mp.get("input", 0)
+    cost += (tokens.get("output_tokens", 0) / 1_000_000) * mp.get("output", 0)
+    cost += (tokens.get("cache_read_tokens", 0) / 1_000_000) * mp.get("cache_read", 0)
+    cost += (tokens.get("cache_creation_tokens", 0) / 1_000_000) * mp.get("cache_write", 0)
+    return cost
+
+
+def format_cost(cost: float) -> str:
+    """Format cost with appropriate precision."""
+    if cost >= 100:
+        return f"${cost:,.0f}"
+    elif cost >= 10:
+        return f"${cost:.2f}"
+    elif cost >= 0.01:
+        return f"${cost:.3f}"
+    elif cost > 0:
+        return f"${cost:.4f}"
+    return "$0.00"
+
+
+def get_cost_color(cost: float) -> str:
+    """Return ANSI color code based on cost magnitude."""
+    if cost >= 10:
+        return "\033[91m"  # BRIGHT_RED
+    elif cost >= 1:
+        return "\033[93m"  # BRIGHT_YELLOW
+    return "\033[92m"  # BRIGHT_GREEN
 
 
 def get_terminal_width() -> int:
@@ -131,6 +222,7 @@ def load_stats(date_str: str) -> Optional[dict]:
 
 def aggregate_stats(from_date: str, to_date: str) -> dict:
     """Aggregate stats across a date range with detailed daily breakdown."""
+    pricing = load_pricing()
     result = {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -139,6 +231,7 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
         "total_tokens": 0,
         "request_count": 0,
         "session_count": 0,
+        "cost": 0.0,
         "by_model": {},
         "daily": [],
     }
@@ -159,6 +252,7 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
             "total_tokens": 0,
             "request_count": 0,
             "session_count": 0,
+            "cost": 0.0,
         }
 
         if stats:
@@ -170,6 +264,12 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
             daily_entry["total_tokens"] = totals.get("total_tokens", 0)
             daily_entry["request_count"] = totals.get("request_count", 0)
             daily_entry["session_count"] = totals.get("session_count", 0)
+            daily_entry["cost"] = totals.get("cost", 0.0)
+
+            # Recalculate cost if not stored (backward compatibility)
+            if daily_entry["cost"] == 0.0 and daily_entry["total_tokens"] > 0:
+                for model, ms in stats.get("by_model", {}).items():
+                    daily_entry["cost"] += calculate_cost(ms, model, pricing)
 
             result["input_tokens"] += daily_entry["input_tokens"]
             result["output_tokens"] += daily_entry["output_tokens"]
@@ -178,6 +278,7 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
             result["total_tokens"] += daily_entry["total_tokens"]
             result["request_count"] += daily_entry["request_count"]
             result["session_count"] += daily_entry["session_count"]
+            result["cost"] += daily_entry["cost"]
 
             for model, model_stats in stats.get("by_model", {}).items():
                 if model not in result["by_model"]:
@@ -187,9 +288,15 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
                         "cache_read_tokens": 0,
                         "cache_creation_tokens": 0,
                         "request_count": 0,
+                        "cost": 0.0,
                     }
                 for key in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_count"]:
                     result["by_model"][model][key] += model_stats.get(key, 0)
+                # Aggregate cost, recalculate if not stored
+                model_cost = model_stats.get("cost", 0.0)
+                if model_cost == 0.0:
+                    model_cost = calculate_cost(model_stats, model, pricing)
+                result["by_model"][model]["cost"] += model_cost
 
         result["daily"].append(daily_entry)
         current += timedelta(days=1)
@@ -318,8 +425,11 @@ def draw_summary(stats: dict, from_date: str, to_date: str) -> list[str]:
     cached = stats['cache_read_tokens'] + stats['cache_creation_tokens']
     total = stats['total_tokens']
 
+    total_cost = stats.get('cost', 0.0)
+    cost_color = get_cost_color(total_cost)
+
     lines.append("")
-    lines.append(f"  {Colors.BRIGHT_WHITE}{Colors.BOLD}TOTAL{Colors.RESET}          {Colors.BRIGHT_GREEN}{format_number(total):>15}{Colors.RESET}   {Colors.DIM}│{Colors.RESET}  Sessions: {stats['session_count']}  Requests: {stats['request_count']}")
+    lines.append(f"  {Colors.BRIGHT_WHITE}{Colors.BOLD}TOTAL{Colors.RESET}          {Colors.BRIGHT_GREEN}{format_number(total):>15}{Colors.RESET}   {Colors.DIM}│{Colors.RESET}  {cost_color}{Colors.BOLD}{format_cost(total_cost)}{Colors.RESET}  {Colors.DIM}│{Colors.RESET}  Sessions: {stats['session_count']}  Requests: {stats['request_count']}")
     lines.append("")
 
     # Non-cached section
@@ -339,19 +449,25 @@ def draw_model_breakdown(by_model: dict) -> list[str]:
         return lines
 
     lines.append(f"  {Colors.BOLD}Per-Model Breakdown{Colors.RESET}")
-    lines.append(f"  {Colors.DIM}{'─' * 70}{Colors.RESET}")
-    lines.append(f"  {Colors.DIM}{'Model':<18} {'↓Input':>9} {'↑Output':>9} {'Cache↓':>9} {'Cache↑':>9} {'Total':>10}{Colors.RESET}")
+    lines.append(f"  {Colors.DIM}{'─' * 75}{Colors.RESET}")
+    # Header with fixed column widths
+    lines.append(
+        f"  {Colors.DIM}{'Model':<14}{'↓Input':>10}{'↑Output':>10}{'Cache↓':>10}{'Cache↑':>10}{'Total':>10}{'Cost':>11}{Colors.RESET}"
+    )
 
     for model, s in sorted(by_model.items()):
         color, display_name = get_model_display(model)
         total = s.get("input_tokens", 0) + s.get("output_tokens", 0) + s.get("cache_read_tokens", 0) + s.get("cache_creation_tokens", 0)
+        cost = s.get("cost", 0.0)
+        cost_color = get_cost_color(cost)
         lines.append(
-            f"  {color}{display_name:<18}{Colors.RESET} "
-            f"{Colors.CYAN}{format_tokens_short(s.get('input_tokens', 0)):>9}{Colors.RESET} "
-            f"{Colors.MAGENTA}{format_tokens_short(s.get('output_tokens', 0)):>9}{Colors.RESET} "
-            f"{Colors.YELLOW}{format_tokens_short(s.get('cache_read_tokens', 0)):>9}{Colors.RESET} "
-            f"{Colors.BLUE}{format_tokens_short(s.get('cache_creation_tokens', 0)):>9}{Colors.RESET} "
+            f"  {color}{display_name:<14}{Colors.RESET}"
+            f"{Colors.CYAN}{format_tokens_short(s.get('input_tokens', 0)):>10}{Colors.RESET}"
+            f"{Colors.MAGENTA}{format_tokens_short(s.get('output_tokens', 0)):>10}{Colors.RESET}"
+            f"{Colors.YELLOW}{format_tokens_short(s.get('cache_read_tokens', 0)):>10}{Colors.RESET}"
+            f"{Colors.BLUE}{format_tokens_short(s.get('cache_creation_tokens', 0)):>10}{Colors.RESET}"
             f"{Colors.BRIGHT_WHITE}{format_tokens_short(total):>10}{Colors.RESET}"
+            f"{cost_color}{format_cost(cost):>11}{Colors.RESET}"
         )
 
     lines.append("")
@@ -370,29 +486,30 @@ def draw_daily_breakdown(daily: list[dict]) -> list[str]:
     max_output = max(d["output_tokens"] for d in daily) or 1
     max_cache_r = max(d["cache_read_tokens"] for d in daily) or 1
     max_cache_w = max(d["cache_creation_tokens"] for d in daily) or 1
-    max_total = max(d["total_tokens"] for d in daily) or 1
 
     # Limit display to last 10 days if too many
     display_daily = daily[-10:] if len(daily) > 10 else daily
 
+    # Column widths: date=8, bar+val=14 each (6 bar + 8 val), total=10, cost=10
     lines.append(f"  {Colors.BOLD}Daily Breakdown{Colors.RESET}")
-    lines.append(f"  {Colors.DIM}{'─' * 70}{Colors.RESET}")
-    lines.append(f"  {Colors.DIM}{'Date':<8} {'↓Input':<12} {'↑Output':<12} {'Cache↓':<12} {'Cache↑':<12} {'Total':>8}{Colors.RESET}")
-    lines.append("")
+    lines.append(f"  {Colors.DIM}{'─' * 75}{Colors.RESET}")
+    lines.append(
+        f"  {Colors.DIM}{'Date':<8}{'↓Input':>14}{'↑Output':>14}{'Cache↓':>14}{'Cache↑':>14}{'Total':>10}{'Cost':>10}{Colors.RESET}"
+    )
 
     for d in display_daily:
         date_obj = datetime.strptime(d["date"], "%Y-%m-%d")
         is_today = d["date"] == datetime.now().strftime("%Y-%m-%d")
 
         if is_today:
-            date_str = f"{Colors.BRIGHT_GREEN}{date_obj.strftime('%b %d')}{Colors.RESET}"
+            date_str = f"{Colors.BRIGHT_GREEN}{date_obj.strftime('%b %d'):<8}{Colors.RESET}"
             marker = " ◀"
         else:
-            date_str = f"{Colors.DIM}{date_obj.strftime('%b %d')}{Colors.RESET}"
+            date_str = f"{Colors.DIM}{date_obj.strftime('%b %d'):<8}{Colors.RESET}"
             marker = ""
 
-        # Mini bars for each metric
-        bar_w = 8
+        # Mini bars for each metric (6 chars) + value (8 chars) = 14 total
+        bar_w = 6
         inp_bar = mini_bar(d["input_tokens"], max_input, bar_w)
         out_bar = mini_bar(d["output_tokens"], max_output, bar_w)
         cr_bar = mini_bar(d["cache_read_tokens"], max_cache_r, bar_w)
@@ -403,14 +520,17 @@ def draw_daily_breakdown(daily: list[dict]) -> list[str]:
         cr_val = format_tokens_short(d["cache_read_tokens"])
         cw_val = format_tokens_short(d["cache_creation_tokens"])
         total_val = format_tokens_short(d["total_tokens"])
+        cost = d.get("cost", 0.0)
+        cost_color = get_cost_color(cost)
 
         lines.append(
-            f"  {date_str:>14} "
-            f"{Colors.CYAN}{inp_bar}{Colors.RESET}{inp_val:>4} "
-            f"{Colors.MAGENTA}{out_bar}{Colors.RESET}{out_val:>4} "
-            f"{Colors.YELLOW}{cr_bar}{Colors.RESET}{cr_val:>4} "
-            f"{Colors.BLUE}{cw_bar}{Colors.RESET}{cw_val:>4} "
-            f"{Colors.BRIGHT_WHITE}{total_val:>8}{Colors.RESET}{marker}"
+            f"  {date_str}"
+            f"{Colors.CYAN}{inp_bar}{inp_val:>8}{Colors.RESET}"
+            f"{Colors.MAGENTA}{out_bar}{out_val:>8}{Colors.RESET}"
+            f"{Colors.YELLOW}{cr_bar}{cr_val:>8}{Colors.RESET}"
+            f"{Colors.BLUE}{cw_bar}{cw_val:>8}{Colors.RESET}"
+            f"{Colors.BRIGHT_WHITE}{total_val:>10}{Colors.RESET}"
+            f"{cost_color}{format_cost(cost):>10}{Colors.RESET}{marker}"
         )
 
     if len(daily) > 10:
@@ -418,6 +538,18 @@ def draw_daily_breakdown(daily: list[dict]) -> list[str]:
 
     lines.append("")
     return lines
+
+
+def sparkline_float(values: list, width: int = 7) -> str:
+    """Sparkline for float values (like costs)."""
+    if not values or max(values) == 0:
+        return SPARK[0] * width
+    max_val = max(values)
+    result = ""
+    for v in values[-width:]:
+        idx = int((v / max_val) * (len(SPARK) - 1)) if max_val > 0 else 0
+        result += SPARK[idx]
+    return result.ljust(width, SPARK[0])
 
 
 def draw_sparkline_graphs(daily: list[dict]) -> list[str]:
@@ -436,14 +568,18 @@ def draw_sparkline_graphs(daily: list[dict]) -> list[str]:
     cache_r = [d["cache_read_tokens"] for d in daily]
     cache_w = [d["cache_creation_tokens"] for d in daily]
     totals = [d["total_tokens"] for d in daily]
+    costs = [d.get("cost", 0.0) for d in daily]
 
     spark_width = min(len(daily), 14)
+    total_cost = sum(costs)
+    cost_color = get_cost_color(total_cost)
 
     lines.append(f"  {Colors.CYAN}Input    {Colors.RESET} {Colors.CYAN}{sparkline(inputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(inputs))}{Colors.RESET}")
     lines.append(f"  {Colors.MAGENTA}Output   {Colors.RESET} {Colors.MAGENTA}{sparkline(outputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(outputs))}{Colors.RESET}")
     lines.append(f"  {Colors.YELLOW}Cache R  {Colors.RESET} {Colors.YELLOW}{sparkline(cache_r, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_r))}{Colors.RESET}")
     lines.append(f"  {Colors.BLUE}Cache W  {Colors.RESET} {Colors.BLUE}{sparkline(cache_w, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_w))}{Colors.RESET}")
     lines.append(f"  {Colors.BRIGHT_WHITE}Total    {Colors.RESET} {Colors.BRIGHT_GREEN}{sparkline(totals, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(totals))}{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_YELLOW}Cost     {Colors.RESET} {Colors.BRIGHT_YELLOW}{sparkline_float(costs, spark_width)}{Colors.RESET}  {cost_color}{format_cost(total_cost)}{Colors.RESET}")
     lines.append("")
 
     return lines
