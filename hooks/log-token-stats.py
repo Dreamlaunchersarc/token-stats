@@ -10,7 +10,9 @@ Token field mapping (API -> Storage -> Display):
 - cache_creation_input_tokens -> cache_creation_tokens -> Cache Write
 """
 
+import fcntl
 import json
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +20,7 @@ from pathlib import Path
 STATS_DIR = Path.home() / ".claude" / "stats"
 DEBUG_LOG = STATS_DIR / "debug.log"
 PRICING_FILE = STATS_DIR / "pricing.json"
+LOCK_FILE = STATS_DIR / ".stats.lock"
 
 # Default API pricing per million tokens (as of 2025)
 # Source: https://docs.anthropic.com/en/docs/about-claude/pricing
@@ -192,13 +195,21 @@ def parse_transcript(transcript_path: str) -> dict:
 
 
 def load_daily_stats(stats_file: Path) -> dict:
-    """Load existing daily stats or create new structure."""
+    """Load existing daily stats or create new structure.
+
+    If the file exists but is corrupted, backs it up and starts fresh.
+    """
     if stats_file.exists():
         try:
             with open(stats_file, "r") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
+        except json.JSONDecodeError as e:
+            # Back up corrupted file instead of silently losing data
+            backup = stats_file.with_suffix(f".corrupted.{datetime.now().strftime('%H%M%S')}.json")
+            shutil.copy2(stats_file, backup)
+            debug_log(f"Corrupted stats file backed up to {backup}: {e}")
+        except IOError as e:
+            debug_log(f"IO error reading stats file: {e}")
 
     return {
         "date": datetime.now().strftime("%Y-%m-%d"),
@@ -256,10 +267,13 @@ def recalculate_daily_totals(daily_stats: dict) -> None:
 
 
 def save_stats(stats_file: Path, stats: dict):
-    """Save stats to file with pretty formatting."""
+    """Save stats to file atomically with pretty formatting."""
     STATS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(stats_file, "w") as f:
+    # Write to temp file first, then rename (atomic on POSIX)
+    temp_file = stats_file.with_suffix(".tmp")
+    with open(temp_file, "w") as f:
         json.dump(stats, f, indent=2)
+    temp_file.rename(stats_file)
 
 
 def main():
@@ -285,31 +299,38 @@ def main():
     today = datetime.now().strftime("%Y-%m-%d")
     stats_file = STATS_DIR / f"{today}.json"
 
-    daily_stats = load_daily_stats(stats_file)
+    # Use file locking to prevent race conditions between concurrent sessions
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)  # Exclusive lock
+        try:
+            daily_stats = load_daily_stats(stats_file)
 
-    session_entry = {
-        "session_id": session_id,
-        "date": today,  # Track which date this session entry belongs to
-        "last_updated": datetime.now().isoformat(),
-        "project": cwd,
-        "by_model": by_model,
-        **session_tokens
-    }
+            session_entry = {
+                "session_id": session_id,
+                "date": today,  # Track which date this session entry belongs to
+                "last_updated": datetime.now().isoformat(),
+                "project": cwd,
+                "by_model": by_model,
+                **session_tokens
+            }
 
-    session_index = next(
-        (i for i, s in enumerate(daily_stats["sessions"]) if s["session_id"] == session_id),
-        None
-    )
+            session_index = next(
+                (i for i, s in enumerate(daily_stats["sessions"]) if s["session_id"] == session_id),
+                None
+            )
 
-    if session_index is not None:
-        session_entry["started"] = daily_stats["sessions"][session_index].get("started", session_entry["last_updated"])
-        daily_stats["sessions"][session_index] = session_entry
-    else:
-        session_entry["started"] = session_entry["last_updated"]
-        daily_stats["sessions"].append(session_entry)
+            if session_index is not None:
+                session_entry["started"] = daily_stats["sessions"][session_index].get("started", session_entry["last_updated"])
+                daily_stats["sessions"][session_index] = session_entry
+            else:
+                session_entry["started"] = session_entry["last_updated"]
+                daily_stats["sessions"].append(session_entry)
 
-    recalculate_daily_totals(daily_stats)
-    save_stats(stats_file, daily_stats)
+            recalculate_daily_totals(daily_stats)
+            save_stats(stats_file, daily_stats)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)  # Release lock
 
     sys.exit(0)
 
