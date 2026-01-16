@@ -22,12 +22,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 STATS_DIR="$CLAUDE_DIR/stats"
+LIB_DIR="$CLAUDE_DIR/lib"
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 
 # Create directories
 echo -e "${CYAN}Creating directories...${NC}"
 mkdir -p "$HOOKS_DIR"
 mkdir -p "$STATS_DIR"
+mkdir -p "$LIB_DIR"
+
+# Copy shared library
+echo -e "${CYAN}Installing shared modules...${NC}"
+cp "$SCRIPT_DIR/lib/pricing.py" "$LIB_DIR/pricing.py"
 
 # Copy hook script
 echo -e "${CYAN}Installing hook script...${NC}"

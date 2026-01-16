@@ -14,82 +14,80 @@ import fcntl
 import json
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-STATS_DIR = Path.home() / ".claude" / "stats"
+# Add lib directory to path for shared modules
+# Supports both development (../lib) and installed (~/.claude/lib) locations
+_script_dir = Path(__file__).resolve().parent
+for _lib_path in [_script_dir.parent / "lib", Path.home() / ".claude" / "lib"]:
+    if _lib_path.exists():
+        sys.path.insert(0, str(_lib_path))
+        break
+
+# Try to import from shared module, fallback to inline definitions for backward compatibility
+try:
+    from pricing import (
+        STATS_DIR, PRICING_FILE,
+        load_pricing, get_model_pricing, calculate_cost
+    )
+except ImportError:
+    # Fallback for users who haven't reinstalled yet
+    STATS_DIR = Path.home() / ".claude" / "stats"
+    PRICING_FILE = STATS_DIR / "pricing.json"
+
+    DEFAULT_PRICING = {
+        "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
+        "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+        "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+        "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00, "cache_read": 0.08, "cache_write": 1.00},
+    }
+
+    FAMILY_PRICING = {
+        "opus": {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
+        "sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+        "haiku": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
+    }
+
+    def get_family_pricing(model: str) -> dict:
+        model_lower = model.lower()
+        if "opus" in model_lower:
+            return FAMILY_PRICING["opus"]
+        elif "haiku" in model_lower:
+            return FAMILY_PRICING["haiku"]
+        return FAMILY_PRICING["sonnet"]
+
+    def load_pricing() -> dict:
+        pricing = DEFAULT_PRICING.copy()
+        if PRICING_FILE.exists():
+            try:
+                with open(PRICING_FILE, "r") as f:
+                    pricing.update(json.load(f))
+            except (json.JSONDecodeError, FileNotFoundError, PermissionError):
+                pass
+        return pricing
+
+    def get_model_pricing(model: str, pricing: dict) -> dict:
+        if model in pricing:
+            return pricing[model]
+        for key in pricing:
+            if key in model or model in key:
+                return pricing[key]
+        return get_family_pricing(model)
+
+    def calculate_cost(tokens: dict, model: str, pricing: dict) -> float:
+        mp = get_model_pricing(model, pricing)
+        cost = 0.0
+        cost += (tokens.get("input_tokens", 0) / 1_000_000) * mp.get("input", 0)
+        cost += (tokens.get("output_tokens", 0) / 1_000_000) * mp.get("output", 0)
+        cost += (tokens.get("cache_read_tokens", 0) / 1_000_000) * mp.get("cache_read", 0)
+        cost += (tokens.get("cache_creation_tokens", 0) / 1_000_000) * mp.get("cache_write", 0)
+        return cost
+
 DEBUG_LOG = STATS_DIR / "debug.log"
-PRICING_FILE = STATS_DIR / "pricing.json"
 LOCK_FILE = STATS_DIR / ".stats.lock"
-
-# Default API pricing per million tokens (as of 2025)
-# Source: https://docs.anthropic.com/en/docs/about-claude/pricing
-DEFAULT_PRICING = {
-    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00, "cache_read": 0.08, "cache_write": 1.00},
-}
-
-# Fallback pricing by model family (used when specific model not found)
-# Uses conservative estimates - cache pricing follows standard multipliers (0.1x read, 1.25x write)
-FAMILY_PRICING = {
-    "opus": {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
-    "sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "haiku": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
-}
-
-
-def get_family_pricing(model: str) -> dict:
-    """Get fallback pricing based on model family (opus/sonnet/haiku)."""
-    model_lower = model.lower()
-    if "opus" in model_lower:
-        return FAMILY_PRICING["opus"]
-    elif "haiku" in model_lower:
-        return FAMILY_PRICING["haiku"]
-    return FAMILY_PRICING["sonnet"]
-
-
-def load_pricing() -> dict:
-    """Load pricing from user config file merged with defaults."""
-    pricing = DEFAULT_PRICING.copy()
-
-    # Load user overrides (highest priority)
-    if PRICING_FILE.exists():
-        try:
-            with open(PRICING_FILE, "r") as f:
-                custom = json.load(f)
-                pricing.update(custom)
-        except (json.JSONDecodeError, IOError):
-            pass
-
-    return pricing
-
-
-def get_model_pricing(model: str, pricing: dict) -> dict:
-    """Get pricing for a model. Falls back to family pricing for unknown models."""
-    # Direct match
-    if model in pricing:
-        return pricing[model]
-
-    # Partial match (model ID contains known key or vice versa)
-    for key in pricing:
-        if key in model or model in key:
-            return pricing[key]
-
-    # Fallback to family-based pricing for unknown models
-    return get_family_pricing(model)
-
-
-def calculate_cost(tokens: dict, model: str, pricing: dict) -> float:
-    """Calculate cost in dollars for given token counts and model."""
-    mp = get_model_pricing(model, pricing)
-    cost = 0.0
-    cost += (tokens.get("input_tokens", 0) / 1_000_000) * mp.get("input", 0)
-    cost += (tokens.get("output_tokens", 0) / 1_000_000) * mp.get("output", 0)
-    cost += (tokens.get("cache_read_tokens", 0) / 1_000_000) * mp.get("cache_read", 0)
-    cost += (tokens.get("cache_creation_tokens", 0) / 1_000_000) * mp.get("cache_write", 0)
-    return cost
+TIMESERIES_FILE = STATS_DIR / "timeseries.json"
+TIMESERIES_WINDOW_MINUTES = 35  # 30 min display + 5 min buffer
 
 
 def debug_log(msg: str):
@@ -99,13 +97,31 @@ def debug_log(msg: str):
         f.write(f"[{datetime.now().isoformat()}] {msg}\n")
 
 
+def parse_iso_timestamp(ts: str) -> datetime:
+    """Parse ISO timestamp string to datetime."""
+    # Handle both 'Z' suffix and '+00:00' timezone formats
+    ts = ts.replace("Z", "+00:00")
+    try:
+        # Python 3.11+ can handle timezone directly
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        # Fallback: strip timezone for older Python
+        if "+" in ts:
+            ts = ts.split("+")[0]
+        elif ts.endswith("Z"):
+            ts = ts[:-1]
+        return datetime.fromisoformat(ts)
+
+
 def parse_transcript(transcript_path: str) -> dict:
     """Parse transcript JSONL and extract token usage per model.
 
     For each request_id, tracks the maximum value seen for each token type
     independently to handle streaming responses correctly.
+    Also tracks timestamps to calculate request duration and tokens/second.
     """
     request_usage = {}
+    request_timing = {}  # Track first/last timestamps per request
 
     try:
         with open(transcript_path, "r") as f:
@@ -120,6 +136,7 @@ def parse_transcript(transcript_path: str) -> dict:
                         usage = message.get("usage", {})
                         request_id = entry.get("requestId")
                         model = message.get("model", "unknown")
+                        timestamp = entry.get("timestamp")
 
                         # Validate we have the required fields
                         if not usage or not request_id:
@@ -150,10 +167,21 @@ def parse_transcript(transcript_path: str) -> dict:
                             # Update model if we get a more specific one
                             if model != "unknown":
                                 existing["model"] = model
+
+                        # Track timestamps for TPS calculation
+                        if timestamp and request_id:
+                            if request_id not in request_timing:
+                                request_timing[request_id] = {
+                                    "first_ts": timestamp,
+                                    "last_ts": timestamp
+                                }
+                            else:
+                                # Update last timestamp (streaming creates multiple entries)
+                                request_timing[request_id]["last_ts"] = timestamp
                 except json.JSONDecodeError:
                     continue
     except FileNotFoundError:
-        return {"by_model": {}, "totals": {}}
+        return {"by_model": {}, "totals": {}, "completed_requests": []}
 
     pricing = load_pricing()
 
@@ -191,7 +219,43 @@ def parse_transcript(transcript_path: str) -> dict:
         totals["cache_read_tokens"] + totals["cache_creation_tokens"]
     )
 
-    return {"by_model": by_model, "totals": totals}
+    # Calculate TPS for completed requests
+    completed_requests = []
+    for req_id, usage in request_usage.items():
+        timing = request_timing.get(req_id, {})
+        first_ts = timing.get("first_ts")
+        last_ts = timing.get("last_ts")
+
+        if first_ts and last_ts:
+            try:
+                first_dt = parse_iso_timestamp(first_ts)
+                last_dt = parse_iso_timestamp(last_ts)
+                duration = (last_dt - first_dt).total_seconds()
+
+                # Only include if we have meaningful duration (> 0.1s and < 1 hour)
+                # Upper bound prevents bad data from clock skew or malformed timestamps
+                if 0.1 < duration < 3600:
+                    output_tokens = usage["output_tokens"]
+                    total_tokens = (
+                        usage["input_tokens"] + usage["output_tokens"] +
+                        usage["cache_read_tokens"] + usage["cache_creation_tokens"]
+                    )
+                    # Calculate cost for this request
+                    req_cost = calculate_cost(usage, usage["model"], pricing)
+                    completed_requests.append({
+                        "request_id": req_id,
+                        "timestamp": last_ts,
+                        "duration_seconds": duration,
+                        "output_tokens": output_tokens,
+                        "total_tokens": total_tokens,
+                        "output_tps": output_tokens / duration,
+                        "total_tps": total_tokens / duration,
+                        "cost": req_cost,
+                    })
+            except (ValueError, TypeError):
+                continue
+
+    return {"by_model": by_model, "totals": totals, "completed_requests": completed_requests}
 
 
 def load_daily_stats(stats_file: Path) -> dict:
@@ -276,10 +340,114 @@ def save_stats(stats_file: Path, stats: dict):
     temp_file.rename(stats_file)
 
 
+def load_timeseries() -> dict:
+    """Load timeseries data or create new structure."""
+    if TIMESERIES_FILE.exists():
+        try:
+            with open(TIMESERIES_FILE, "r") as f:
+                data = json.load(f)
+                # Validate structure
+                if "version" in data and "buckets" in data:
+                    return data
+        except (json.JSONDecodeError, FileNotFoundError, PermissionError):
+            pass
+    return {
+        "version": 1,
+        "buckets": {},
+        "seen_request_ids": []
+    }
+
+
+def update_timeseries(data: dict, completed_requests: list, session_id: str) -> dict:
+    """Update timeseries with new request data, aggregating into minute buckets.
+
+    Uses absolute minute keys (e.g., "2026-01-15T11:14") so historical values
+    are frozen once a minute passes.
+    """
+    now = datetime.now()
+    cutoff = now - timedelta(minutes=TIMESERIES_WINDOW_MINUTES)
+
+    # Prune old buckets
+    buckets = data.get("buckets", {})
+    data["buckets"] = {
+        k: v for k, v in buckets.items()
+        if parse_iso_timestamp(k + ":00") > cutoff
+    }
+
+    # Prune old seen_request_ids (keep last 1000 to prevent unbounded growth)
+    # Use set for O(1) lookup during deduplication
+    seen_ids = data.get("seen_request_ids", [])
+    if len(seen_ids) > 1000:
+        seen_ids = seen_ids[-900:]  # Keep 90% instead of 50% for smoother pruning
+    seen_ids_set = set(seen_ids)
+    data["seen_request_ids"] = seen_ids
+    data["_seen_ids_set"] = seen_ids_set  # Temporary set for fast lookup
+
+    # Process new completed requests
+    for req in completed_requests:
+        req_id = req.get("request_id")
+        if not req_id or req_id in seen_ids_set:
+            continue  # Skip duplicates (O(1) set lookup)
+
+        timestamp = req.get("timestamp")
+        if not timestamp:
+            continue
+
+        try:
+            ts_dt = parse_iso_timestamp(timestamp)
+        except (ValueError, TypeError):
+            continue
+
+        # Create minute bucket key (e.g., "2026-01-15T11:14")
+        bucket_key = ts_dt.strftime("%Y-%m-%dT%H:%M")
+
+        # Initialize bucket if needed
+        if bucket_key not in data["buckets"]:
+            data["buckets"][bucket_key] = {
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "total_duration": 0.0,
+                "request_count": 0,
+                "output_tps": 0.0,
+                "total_tps": 0.0,
+                "cost": 0.0,
+            }
+
+        bucket = data["buckets"][bucket_key]
+        bucket["output_tokens"] += req.get("output_tokens", 0)
+        bucket["total_tokens"] += req.get("total_tokens", 0)
+        bucket["total_duration"] += req.get("duration_seconds", 0.0)
+        bucket["request_count"] += 1
+        bucket["cost"] = bucket.get("cost", 0.0) + req.get("cost", 0.0)
+
+        # Recalculate average TPS for the bucket
+        if bucket["total_duration"] > 0:
+            bucket["output_tps"] = bucket["output_tokens"] / bucket["total_duration"]
+            bucket["total_tps"] = bucket["total_tokens"] / bucket["total_duration"]
+
+        # Mark request as seen
+        data["seen_request_ids"].append(req_id)
+        seen_ids_set.add(req_id)
+
+    # Clean up temporary set before returning (not needed in JSON)
+    data.pop("_seen_ids_set", None)
+    return data
+
+
+def save_timeseries(data: dict):
+    """Save timeseries atomically."""
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = TIMESERIES_FILE.with_suffix(".tmp")
+    with open(temp_file, "w") as f:
+        json.dump(data, f, indent=2)
+    temp_file.rename(TIMESERIES_FILE)
+
+
 def main():
     try:
         hook_input = json.load(sys.stdin)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        debug_log(f"Invalid JSON input from hook: {e}")
         sys.exit(0)
 
     transcript_path = hook_input.get("transcript_path")
@@ -292,6 +460,7 @@ def main():
     parsed = parse_transcript(transcript_path)
     session_tokens = parsed["totals"]
     by_model = parsed["by_model"]
+    completed_requests = parsed.get("completed_requests", [])
 
     if session_tokens.get("total_tokens", 0) == 0:
         sys.exit(0)
@@ -301,7 +470,7 @@ def main():
 
     # Use file locking to prevent race conditions between concurrent sessions
     STATS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(LOCK_FILE, "w") as lock_file:
+    with open(LOCK_FILE, "a") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)  # Exclusive lock
         try:
             daily_stats = load_daily_stats(stats_file)
@@ -329,6 +498,12 @@ def main():
 
             recalculate_daily_totals(daily_stats)
             save_stats(stats_file, daily_stats)
+
+            # Update timeseries for TPS graph (only if we have new requests)
+            if completed_requests:
+                ts_data = load_timeseries()
+                ts_data = update_timeseries(ts_data, completed_requests, session_id)
+                save_timeseries(ts_data)
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)  # Release lock
 

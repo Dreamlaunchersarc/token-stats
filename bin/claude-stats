@@ -10,84 +10,82 @@ import os
 import tty
 import termios
 import select
+import signal
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+# Add lib directory to path for shared modules
+_script_dir = Path(__file__).resolve().parent
+for _lib_path in [_script_dir.parent / "lib", Path.home() / ".claude" / "lib"]:
+    if _lib_path.exists():
+        sys.path.insert(0, str(_lib_path))
+        break
+
+# Try to import from shared module, fallback to inline definitions for backward compatibility
+try:
+    from pricing import (
+        DEFAULT_PRICING, FAMILY_PRICING, STATS_DIR, PRICING_FILE,
+        load_pricing, get_model_pricing, calculate_cost
+    )
+except ImportError:
+    # Fallback for users who haven't reinstalled yet
+    STATS_DIR = Path.home() / ".claude" / "stats"
+    PRICING_FILE = STATS_DIR / "pricing.json"
+
+    DEFAULT_PRICING = {
+        "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
+        "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+        "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+        "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00, "cache_read": 0.08, "cache_write": 1.00},
+    }
+
+    FAMILY_PRICING = {
+        "opus": {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
+        "sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+        "haiku": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
+    }
+
+    def get_family_pricing(model: str) -> dict:
+        model_lower = model.lower()
+        if "opus" in model_lower:
+            return FAMILY_PRICING["opus"]
+        elif "haiku" in model_lower:
+            return FAMILY_PRICING["haiku"]
+        return FAMILY_PRICING["sonnet"]
+
+    def load_pricing() -> dict:
+        pricing = DEFAULT_PRICING.copy()
+        if PRICING_FILE.exists():
+            try:
+                with open(PRICING_FILE, "r") as f:
+                    pricing.update(json.load(f))
+            except (json.JSONDecodeError, FileNotFoundError, PermissionError):
+                pass
+        return pricing
+
+    def get_model_pricing(model: str, pricing: dict) -> dict:
+        if model in pricing:
+            return pricing[model]
+        for key in pricing:
+            if key in model or model in key:
+                return pricing[key]
+        return get_family_pricing(model)
+
+    def calculate_cost(tokens: dict, model: str, pricing: dict) -> float:
+        mp = get_model_pricing(model, pricing)
+        cost = 0.0
+        cost += (tokens.get("input_tokens", 0) / 1_000_000) * mp.get("input", 0)
+        cost += (tokens.get("output_tokens", 0) / 1_000_000) * mp.get("output", 0)
+        cost += (tokens.get("cache_read_tokens", 0) / 1_000_000) * mp.get("cache_read", 0)
+        cost += (tokens.get("cache_creation_tokens", 0) / 1_000_000) * mp.get("cache_write", 0)
+        return cost
+
 REFRESH_INTERVAL = 2  # seconds
 CONTENT_WIDTH = 75  # Fixed content width for centering
 
-STATS_DIR = Path.home() / ".claude" / "stats"
-PRICING_FILE = STATS_DIR / "pricing.json"
-
-# Default API pricing per million tokens (as of 2025)
-# Source: https://docs.anthropic.com/en/docs/about-claude/pricing
-DEFAULT_PRICING = {
-    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00, "cache_read": 0.08, "cache_write": 1.00},
-}
-
-# Fallback pricing by model family (used when specific model not found)
-FAMILY_PRICING = {
-    "opus": {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
-    "sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "haiku": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
-}
-
-
-def get_family_pricing(model: str) -> dict:
-    """Get fallback pricing based on model family (opus/sonnet/haiku)."""
-    model_lower = model.lower()
-    if "opus" in model_lower:
-        return FAMILY_PRICING["opus"]
-    elif "haiku" in model_lower:
-        return FAMILY_PRICING["haiku"]
-    return FAMILY_PRICING["sonnet"]
-
-
-def load_pricing() -> dict:
-    """Load pricing from user config file merged with defaults."""
-    pricing = DEFAULT_PRICING.copy()
-
-    # Load user overrides (highest priority)
-    if PRICING_FILE.exists():
-        try:
-            with open(PRICING_FILE, "r") as f:
-                custom = json.load(f)
-                pricing.update(custom)
-        except (json.JSONDecodeError, IOError):
-            pass
-
-    return pricing
-
-
-def get_model_pricing(model: str, pricing: dict) -> dict:
-    """Get pricing for a model. Falls back to family pricing for unknown models."""
-    # Direct match
-    if model in pricing:
-        return pricing[model]
-
-    # Partial match
-    for key in pricing:
-        if key in model or model in key:
-            return pricing[key]
-
-    # Fallback to family-based pricing
-    return get_family_pricing(model)
-
-
-def calculate_cost(tokens: dict, model: str, pricing: dict) -> float:
-    """Calculate cost for given token counts."""
-    mp = get_model_pricing(model, pricing)
-    cost = 0.0
-    cost += (tokens.get("input_tokens", 0) / 1_000_000) * mp.get("input", 0)
-    cost += (tokens.get("output_tokens", 0) / 1_000_000) * mp.get("output", 0)
-    cost += (tokens.get("cache_read_tokens", 0) / 1_000_000) * mp.get("cache_read", 0)
-    cost += (tokens.get("cache_creation_tokens", 0) / 1_000_000) * mp.get("cache_write", 0)
-    return cost
+TIMESERIES_FILE = STATS_DIR / "timeseries.json"
 
 
 def format_cost(cost: float) -> str:
@@ -215,9 +213,75 @@ def load_stats(date_str: str) -> Optional[dict]:
         try:
             with open(stats_file, "r") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, FileNotFoundError, PermissionError):
             pass
     return None
+
+
+def parse_iso_timestamp(ts: str) -> datetime:
+    """Parse ISO timestamp string to datetime."""
+    ts = ts.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        if "+" in ts:
+            ts = ts.split("+")[0]
+        elif ts.endswith("Z"):
+            ts = ts[:-1]
+        return datetime.fromisoformat(ts)
+
+
+def load_timeseries() -> dict:
+    """Load timeseries data for TPS graph."""
+    if TIMESERIES_FILE.exists():
+        try:
+            with open(TIMESERIES_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError, PermissionError):
+            pass
+    return {"version": 1, "buckets": {}, "seen_request_ids": []}
+
+
+def get_recent_buckets(window_minutes: int = 30) -> list[dict]:
+    """Get TPS buckets for the last N minutes.
+
+    Returns a list of bucket data, one per minute, with zeros for missing minutes.
+    Uses absolute minute keys for historical consistency.
+    """
+    data = load_timeseries()
+    buckets = data.get("buckets", {})
+
+    now = datetime.now()
+    result = []
+
+    for i in range(window_minutes):
+        # Calculate minute slot from oldest to newest
+        minute_dt = now - timedelta(minutes=window_minutes - 1 - i)
+        bucket_key = minute_dt.strftime("%Y-%m-%dT%H:%M")
+
+        if bucket_key in buckets:
+            bucket = buckets[bucket_key]
+            result.append({
+                "minute": minute_dt.strftime("%H:%M"),
+                "output_tps": bucket.get("output_tps", 0),
+                "total_tps": bucket.get("total_tps", 0),
+                "output_tokens": bucket.get("output_tokens", 0),
+                "total_tokens": bucket.get("total_tokens", 0),
+                "request_count": bucket.get("request_count", 0),
+                "cost": bucket.get("cost", 0.0),
+            })
+        else:
+            result.append({
+                "minute": minute_dt.strftime("%H:%M"),
+                "output_tps": 0,
+                "total_tps": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "request_count": 0,
+                "cost": 0.0,
+            })
+
+    return result
 
 
 def aggregate_stats(from_date: str, to_date: str) -> dict:
@@ -238,6 +302,10 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
 
     current = datetime.strptime(from_date, "%Y-%m-%d")
     end = datetime.strptime(to_date, "%Y-%m-%d")
+
+    # Ensure from_date <= to_date
+    if current > end:
+        current, end = end, current
 
     while current <= end:
         date_str = current.strftime("%Y-%m-%d")
@@ -340,12 +408,14 @@ def get_key(timeout: float = REFRESH_INTERVAL):
 
 
 def sparkline(values: list, width: int = 7) -> str:
-    if not values or max(values) == 0:
+    if not values:
         return SPARK[0] * width
     max_val = max(values)
+    if max_val == 0:
+        return SPARK[0] * width
     result = ""
     for v in values[-width:]:
-        idx = int((v / max_val) * (len(SPARK) - 1)) if max_val > 0 else 0
+        idx = int((v / max_val) * (len(SPARK) - 1))
         result += SPARK[idx]
     return result.ljust(width, SPARK[0])
 
@@ -361,7 +431,9 @@ def mini_bar(value: int, max_val: int, width: int = 10, char: str = '█', empty
 
 
 def clear_screen():
-    print("\033[2J\033[H", end="", flush=True)
+    # Move cursor to home position, then clear from cursor to end of screen
+    # Using \033[H\033[J instead of \033[2J\033[H avoids screen flicker
+    print("\033[H\033[J", end="", flush=True)
 
 
 def hide_cursor():
@@ -481,11 +553,17 @@ def draw_daily_breakdown(daily: list[dict]) -> list[str]:
     if not daily:
         return lines
 
-    # Calculate maxes for scaling
-    max_input = max(d["input_tokens"] for d in daily) or 1
-    max_output = max(d["output_tokens"] for d in daily) or 1
-    max_cache_r = max(d["cache_read_tokens"] for d in daily) or 1
-    max_cache_w = max(d["cache_creation_tokens"] for d in daily) or 1
+    # Calculate all maxes in a single pass for better performance
+    max_input = max_output = max_cache_r = max_cache_w = 0
+    for d in daily:
+        max_input = max(max_input, d["input_tokens"])
+        max_output = max(max_output, d["output_tokens"])
+        max_cache_r = max(max_cache_r, d["cache_read_tokens"])
+        max_cache_w = max(max_cache_w, d["cache_creation_tokens"])
+    max_input = max_input or 1
+    max_output = max_output or 1
+    max_cache_r = max_cache_r or 1
+    max_cache_w = max_cache_w or 1
 
     # Limit display to last 10 days if too many
     display_daily = daily[-10:] if len(daily) > 10 else daily
@@ -542,12 +620,14 @@ def draw_daily_breakdown(daily: list[dict]) -> list[str]:
 
 def sparkline_float(values: list, width: int = 7) -> str:
     """Sparkline for float values (like costs)."""
-    if not values or max(values) == 0:
+    if not values:
         return SPARK[0] * width
     max_val = max(values)
+    if max_val == 0:
+        return SPARK[0] * width
     result = ""
     for v in values[-width:]:
-        idx = int((v / max_val) * (len(SPARK) - 1)) if max_val > 0 else 0
+        idx = int((v / max_val) * (len(SPARK) - 1))
         result += SPARK[idx]
     return result.ljust(width, SPARK[0])
 
@@ -580,6 +660,153 @@ def draw_sparkline_graphs(daily: list[dict]) -> list[str]:
     lines.append(f"  {Colors.BLUE}Cache W  {Colors.RESET} {Colors.BLUE}{sparkline(cache_w, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_w))}{Colors.RESET}")
     lines.append(f"  {Colors.BRIGHT_WHITE}Total    {Colors.RESET} {Colors.BRIGHT_GREEN}{sparkline(totals, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(totals))}{Colors.RESET}")
     lines.append(f"  {Colors.BRIGHT_YELLOW}Cost     {Colors.RESET} {Colors.BRIGHT_YELLOW}{sparkline_float(costs, spark_width)}{Colors.RESET}  {cost_color}{format_cost(total_cost)}{Colors.RESET}")
+    lines.append("")
+
+    return lines
+
+
+def format_tps(v: float) -> str:
+    """Format TPS value."""
+    if v >= 1000:
+        return f"{v/1000:.1f}K"
+    elif v >= 100:
+        return f"{v:.0f}"
+    elif v >= 10:
+        return f"{v:.1f}"
+    elif v > 0:
+        return f"{v:.1f}"
+    return "0"
+
+
+def draw_btop_graph(values: list, height: int, width: int, color: str, label: str = "") -> list[str]:
+    """Draw a btop-style area graph with filled blocks."""
+    lines = []
+    max_val = max(values) if values else 0
+    if max_val <= 0:
+        max_val = 1
+
+    # Scale values to fill width (stretch data to fit)
+    if not values:
+        sampled = [0] * width
+    else:
+        sampled = []
+        for i in range(width):
+            val_idx = int(i * len(values) / width)
+            sampled.append(values[min(val_idx, len(values) - 1)])
+
+    # Build rows from top to bottom
+    for row in range(height - 1, -1, -1):
+        threshold = (row / height) * max_val
+        row_chars = ""
+        for val in sampled:
+            if val > threshold:
+                # Calculate fill level within this cell
+                cell_bottom = threshold
+                cell_top = ((row + 1) / height) * max_val
+                fill_ratio = min(1.0, (val - cell_bottom) / (cell_top - cell_bottom)) if cell_top > cell_bottom else 1.0
+                if fill_ratio >= 0.875:
+                    row_chars += "█"
+                elif fill_ratio >= 0.75:
+                    row_chars += "▇"
+                elif fill_ratio >= 0.625:
+                    row_chars += "▆"
+                elif fill_ratio >= 0.5:
+                    row_chars += "▅"
+                elif fill_ratio >= 0.375:
+                    row_chars += "▄"
+                elif fill_ratio >= 0.25:
+                    row_chars += "▃"
+                elif fill_ratio >= 0.125:
+                    row_chars += "▂"
+                else:
+                    row_chars += "▁"
+            else:
+                row_chars += " "
+        lines.append(f"{color}{row_chars}{Colors.RESET}")
+
+    return lines
+
+
+def draw_realtime_view(buckets: list[dict]) -> list[str]:
+    """Draw btop-style real-time monitoring view."""
+    lines = []
+    now = datetime.now()
+
+    # Header
+    lines.append("")
+    lines.append(f"  {Colors.BOLD}{Colors.BRIGHT_CYAN}╭{'─' * 68}╮{Colors.RESET}")
+    lines.append(f"  {Colors.BOLD}{Colors.BRIGHT_CYAN}│{Colors.BRIGHT_WHITE}              ⚡ REAL-TIME TOKEN THROUGHPUT ⚡                     {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+    lines.append(f"  {Colors.BOLD}{Colors.BRIGHT_CYAN}╰{'─' * 68}╯{Colors.RESET}")
+    lines.append(f"  {Colors.DIM}{now.strftime('%H:%M:%S')} • Press S for stats view • Q to quit{Colors.RESET}")
+    lines.append("")
+
+    # Extract values
+    output_values = [b["output_tps"] for b in buckets]
+    total_values = [b["total_tps"] for b in buckets]
+
+    # Calculate stats
+    current_output = next((v for v in reversed(output_values) if v > 0), 0)
+    current_total = next((v for v in reversed(total_values) if v > 0), 0)
+    peak_output = max(output_values) if output_values else 0
+    peak_total = max(total_values) if total_values else 0
+    avg_output = sum(v for v in output_values if v > 0) / max(1, sum(1 for v in output_values if v > 0))
+    avg_total = sum(v for v in total_values if v > 0) / max(1, sum(1 for v in total_values if v > 0))
+
+    graph_width = 60
+    graph_height = 8
+
+    # Output TPS Graph
+    lines.append(f"  {Colors.BRIGHT_MAGENTA}┌{'─' * (graph_width + 2)}┐{Colors.RESET}")
+    out_header = f"Output tok/s  Now:{format_tps(current_output):>5}/s  Peak:{format_tps(peak_output):>5}/s  Avg:{format_tps(avg_output):>5}/s"
+    lines.append(f"  {Colors.BRIGHT_MAGENTA}│{Colors.RESET} {Colors.BOLD}{out_header:<{graph_width}}{Colors.RESET} {Colors.BRIGHT_MAGENTA}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_MAGENTA}├{'─' * (graph_width + 2)}┤{Colors.RESET}")
+
+    # Draw output graph
+    graph_lines = draw_btop_graph(output_values, graph_height, graph_width, Colors.MAGENTA)
+    for gl in graph_lines:
+        lines.append(f"  {Colors.BRIGHT_MAGENTA}│{Colors.RESET} {gl} {Colors.BRIGHT_MAGENTA}│{Colors.RESET}")
+
+    lines.append(f"  {Colors.BRIGHT_MAGENTA}├{'─' * (graph_width + 2)}┤{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_MAGENTA}│{Colors.RESET} {Colors.DIM}-30m{' ' * (graph_width - 7)}now{Colors.RESET} {Colors.BRIGHT_MAGENTA}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_MAGENTA}└{'─' * (graph_width + 2)}┘{Colors.RESET}")
+    lines.append("")
+
+    # Total TPS Graph
+    lines.append(f"  {Colors.BRIGHT_CYAN}┌{'─' * (graph_width + 2)}┐{Colors.RESET}")
+    tot_header = f"Total tok/s   Now:{format_tps(current_total):>5}/s  Peak:{format_tps(peak_total):>5}/s  Avg:{format_tps(avg_total):>5}/s"
+    lines.append(f"  {Colors.BRIGHT_CYAN}│{Colors.RESET} {Colors.BOLD}{tot_header:<{graph_width}}{Colors.RESET} {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_CYAN}├{'─' * (graph_width + 2)}┤{Colors.RESET}")
+
+    # Draw total graph
+    graph_lines = draw_btop_graph(total_values, graph_height, graph_width, Colors.CYAN)
+    for gl in graph_lines:
+        lines.append(f"  {Colors.BRIGHT_CYAN}│{Colors.RESET} {gl} {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+
+    lines.append(f"  {Colors.BRIGHT_CYAN}├{'─' * (graph_width + 2)}┤{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_CYAN}│{Colors.RESET} {Colors.DIM}-30m{' ' * (graph_width - 7)}now{Colors.RESET} {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_CYAN}└{'─' * (graph_width + 2)}┘{Colors.RESET}")
+    lines.append("")
+
+    # Quick stats panel
+    total_requests = sum(b["request_count"] for b in buckets)
+    total_output = sum(b["output_tokens"] for b in buckets)
+    total_all = sum(b["total_tokens"] for b in buckets)
+    total_cost = sum(b["cost"] for b in buckets)
+    cost_color = get_cost_color(total_cost)
+    active_mins = sum(1 for b in buckets if b['request_count'] > 0)
+
+    avg_req = total_requests / max(1, active_mins)
+
+    lines.append(f"  {Colors.BRIGHT_GREEN}┌{'─' * 29}┐{Colors.RESET}  {Colors.BRIGHT_YELLOW}┌{'─' * 29}┐{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_GREEN}│{Colors.RESET} {Colors.BOLD}Last 30 Minutes{Colors.RESET}             {Colors.BRIGHT_GREEN}│{Colors.RESET}  {Colors.BRIGHT_YELLOW}│{Colors.RESET} {Colors.BOLD}Activity{Colors.RESET}                    {Colors.BRIGHT_YELLOW}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_GREEN}├{'─' * 29}┤{Colors.RESET}  {Colors.BRIGHT_YELLOW}├{'─' * 29}┤{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_GREEN}│{Colors.RESET}  Requests:      {total_requests:>11} {Colors.BRIGHT_GREEN}│{Colors.RESET}  {Colors.BRIGHT_YELLOW}│{Colors.RESET}  Active mins:       {active_mins:>7} {Colors.BRIGHT_YELLOW}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_GREEN}│{Colors.RESET}  Output tokens: {format_tokens_short(total_output):>11} {Colors.BRIGHT_GREEN}│{Colors.RESET}  {Colors.BRIGHT_YELLOW}│{Colors.RESET}  Idle mins:         {30 - active_mins:>7} {Colors.BRIGHT_YELLOW}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_GREEN}│{Colors.RESET}  Total tokens:  {format_tokens_short(total_all):>11} {Colors.BRIGHT_GREEN}│{Colors.RESET}  {Colors.BRIGHT_YELLOW}│{Colors.RESET}  Avg req/min:       {avg_req:>7.1f} {Colors.BRIGHT_YELLOW}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_GREEN}│{Colors.RESET}  Cost:          {cost_color}{format_cost(total_cost):>11}{Colors.RESET} {Colors.BRIGHT_GREEN}│{Colors.RESET}  {Colors.BRIGHT_YELLOW}│{Colors.RESET}                             {Colors.BRIGHT_YELLOW}│{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_GREEN}└{'─' * 29}┘{Colors.RESET}  {Colors.BRIGHT_YELLOW}└{'─' * 29}┘{Colors.RESET}")
+    lines.append("")
+    lines.append(f"  {Colors.DIM}Auto-refreshing every {REFRESH_INTERVAL}s{Colors.RESET}")
     lines.append("")
 
     return lines
@@ -654,18 +881,46 @@ def draw_stacked_bar_chart(daily: list[dict]) -> list[str]:
 
 
 def interactive_mode():
-    """Run interactive date picker mode."""
+    """Run interactive date picker mode with stats and realtime views."""
     today = datetime.now()
     from_date = today - timedelta(days=6)
     to_date = today
     selected = 0
+    view = 'stats'  # 'stats' or 'realtime'
+
+    # Set up signal handlers for clean exit on Ctrl+C
+    def cleanup_handler(signum, frame):
+        show_cursor()
+        clear_screen()
+        sys.exit(0)
+
+    original_sigint = signal.signal(signal.SIGINT, cleanup_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, cleanup_handler)
 
     hide_cursor()
 
     try:
         while True:
             clear_screen()
+            today = datetime.now()  # Update today on each refresh
 
+            if view == 'realtime':
+                # Real-time throughput view
+                tps_buckets = get_recent_buckets(30)
+                output = draw_realtime_view(tps_buckets)
+                print("\n".join(center_output(output)), flush=True)
+
+                key = get_key()
+
+                if key is None:
+                    continue  # Auto-refresh
+                elif key in ('q', 'Q', '\x03'):
+                    break
+                elif key in ('s', 'S'):
+                    view = 'stats'  # Switch to stats view
+                continue
+
+            # Stats view
             from_str = from_date.strftime("%Y-%m-%d")
             to_str = to_date.strftime("%Y-%m-%d")
 
@@ -678,7 +933,7 @@ def interactive_mode():
             output.extend(draw_model_breakdown(stats.get("by_model", {})))
             output.extend(draw_sparkline_graphs(stats.get("daily", [])))
             output.extend(draw_daily_breakdown(stats.get("daily", [])))
-            output.append(f"  {Colors.DIM}Stats: ~/.claude/stats/  •  Auto-refreshing every {REFRESH_INTERVAL}s{Colors.RESET}")
+            output.append(f"  {Colors.DIM}Stats: ~/.claude/stats/  •  R: realtime  •  Auto-refreshing every {REFRESH_INTERVAL}s{Colors.RESET}")
             output.append("")
 
             print("\n".join(center_output(output)), flush=True)
@@ -689,6 +944,8 @@ def interactive_mode():
                 continue  # Auto-refresh on timeout
             elif key in ('q', 'Q', '\x03'):
                 break
+            elif key in ('r', 'R'):
+                view = 'realtime'  # Switch to realtime view
             elif key == 'LEFT':
                 selected = 0
             elif key == 'RIGHT':
@@ -720,6 +977,9 @@ def interactive_mode():
                 to_date = today
 
     finally:
+        # Restore original signal handlers
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
         show_cursor()
         clear_screen()
 
